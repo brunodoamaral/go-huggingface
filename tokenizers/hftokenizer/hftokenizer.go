@@ -5,7 +5,9 @@ package hftokenizer
 
 import (
 	"encoding/json"
+	"fmt"
 	"os"
+	"regexp"
 	"sort"
 	"strings"
 	"unicode"
@@ -43,10 +45,10 @@ type AddedToken struct {
 
 // Normalizer represents the normalizer configuration.
 type Normalizer struct {
-	Type       string       `json:"type"`
-	Lowercase  bool         `json:"lowercase"`
-	Normalizer *Normalizer  `json:"normalizer"`
-	Pattern    *Pattern     `json:"pattern"`
+	Type        string       `json:"type"`
+	Lowercase   bool         `json:"lowercase"`
+	Normalizer  *Normalizer  `json:"normalizer"`
+	Pattern     *Pattern     `json:"pattern"`
 	Normalizers []Normalizer `json:"normalizers"`
 }
 
@@ -64,6 +66,9 @@ type PreTokenizer struct {
 	Pattern        *Pattern       `json:"pattern"`
 	Behavior       string         `json:"behavior"`
 	Invert         bool           `json:"invert"`
+	Replacement    string         `json:"replacement"`
+	PrependScheme  string         `json:"prepend_scheme"`
+	Split          *bool          `json:"split"`
 }
 
 // PostProcessor represents the post-processor configuration.
@@ -101,12 +106,15 @@ type PostProcSpecialToken struct {
 
 // Decoder represents the decoder configuration.
 type Decoder struct {
-	Type       string    `json:"type"`
-	Prefix     string    `json:"prefix"`
-	Suffix     string    `json:"suffix"`
-	Decoders   []Decoder `json:"decoders"`
-	Pattern    *Pattern  `json:"pattern"`
-	Content    string    `json:"content"`
+	Type          string    `json:"type"`
+	Prefix        string    `json:"prefix"`
+	Suffix        string    `json:"suffix"`
+	Decoders      []Decoder `json:"decoders"`
+	Pattern       *Pattern  `json:"pattern"`
+	Content       string    `json:"content"`
+	Replacement   string    `json:"replacement"`
+	PrependScheme string    `json:"prepend_scheme"`
+	Split         bool      `json:"split"`
 }
 
 // Model represents the tokenizer model (WordPiece, BPE, or Unigram).
@@ -222,6 +230,8 @@ type Tokenizer struct {
 	// Added tokens lookup (content -> id)
 	addedTokens map[string]int
 
+	options api.EncodeOptions
+
 	// addedTokensSorted lists added tokens sorted longest-first for greedy
 	// matching when splitting input text. Derived from addedTokens at construction.
 	addedTokensSorted []addedTokenEntry
@@ -229,9 +239,6 @@ type Tokenizer struct {
 
 // Compile time assert that Tokenizer implements api.Tokenizer interface.
 var _ api.Tokenizer = &Tokenizer{}
-
-// Compile time assert that Tokenizer implements api.TokenizerWithSpans interface.
-var _ api.TokenizerWithSpans = &Tokenizer{}
 
 // New creates a HuggingFace tokenizer from the tokenizer.json file.
 // It implements a tokenizer.TokenizerConstructor function signature.
@@ -274,6 +281,9 @@ func NewFromContent(config *api.Config, content []byte) (*Tokenizer, error) {
 		clsID:       -1,
 		sepID:       -1,
 		maskID:      -1,
+		options: api.EncodeOptions{
+			AddSpecialTokens: true,
+		},
 	}
 
 	// Build reverse vocab (id -> token)
@@ -384,23 +394,45 @@ func (t *Tokenizer) resolveSpecialTokens() {
 	}
 }
 
+// Normalize returns the normalization used by the tokenizer (e.g.: BERT lower cases the string).
+func (t *Tokenizer) Normalize(text string) string {
+	if t.tokenizer.Normalizer == nil {
+		return text
+	}
+	return t.applyNormalizer(text, t.tokenizer.Normalizer)
+}
+
+// With applies options to a tokenizer.
+func (t *Tokenizer) With(options api.EncodeOptions) error {
+	t.options = options
+	return nil
+}
+
 // Encode converts text to a sequence of token IDs, including post-processing
 // (e.g., [CLS]/[SEP] wrapping for BERT-style models).
 // This matches Python's tokenizer(text) default behavior.
 func (t *Tokenizer) Encode(text string) []int {
-	return t.EncodeWithOptions(text, true)
-}
-
-// EncodeWithOptions converts text to a sequence of token IDs.
-// When addSpecialTokens is true, post-processing is applied (e.g., [CLS]/[SEP]
-// for BERT-style models). When false, only tokenization is performed.
-// This matches the Rust HuggingFace tokenizer's EncodeWithOptions signature.
-func (t *Tokenizer) EncodeWithOptions(text string, addSpecialTokens bool) []int {
 	result := t.encodeCore(text)
-	if addSpecialTokens {
-		result.IDs, _ = t.applyPostProcessor(result.IDs, result.Spans)
+	if t.options.AddSpecialTokens {
+		result.IDs, result.Spans, _ = t.applyPostProcessor(result.IDs, result.Spans)
 	}
 	return result.IDs
+}
+
+// EncodeWithAnnotations returns the encoded text along with requested annotations.
+func (t *Tokenizer) EncodeWithAnnotations(text string) api.AnnotatedEncoding {
+	result := t.encodeCore(text)
+	var specialTokensMask []int
+	if t.options.AddSpecialTokens {
+		result.IDs, result.Spans, specialTokensMask = t.applyPostProcessor(result.IDs, result.Spans)
+	}
+	if !t.options.IncludeSpans {
+		result.Spans = nil
+	}
+	if t.options.IncludeSpecialTokensMask {
+		result.SpecialTokensMask = specialTokensMask
+	}
+	return result
 }
 
 // wordWithOffset holds a word/token string along with its character offset in the original text.
@@ -410,17 +442,9 @@ type wordWithOffset struct {
 	end   int // end position in original text (exclusive)
 }
 
-// EncodeWithSpans converts text to a sequence of token IDs along with their byte spans,
-// including post-processing.
-func (t *Tokenizer) EncodeWithSpans(text string) api.EncodingResult {
-	result := t.encodeCore(text)
-	result.IDs, result.Spans = t.applyPostProcessor(result.IDs, result.Spans)
-	return result
-}
-
 // encodeCore runs the core tokenization pipeline (split added tokens → normalize →
 // pre-tokenize → tokenize) without post-processing.
-func (t *Tokenizer) encodeCore(text string) api.EncodingResult {
+func (t *Tokenizer) encodeCore(text string) api.AnnotatedEncoding {
 	segments := t.splitOnAddedTokens(text)
 
 	var ids []int
@@ -449,7 +473,7 @@ func (t *Tokenizer) encodeCore(text string) api.EncodingResult {
 		}
 	}
 
-	return api.EncodingResult{
+	return api.AnnotatedEncoding{
 		IDs:   ids,
 		Spans: spans,
 	}
@@ -460,10 +484,10 @@ func (t *Tokenizer) encodeCore(text string) api.EncodingResult {
 // This matches the Rust tokenizer's addSpecialTokens=true behavior.
 //
 // Supported types: TemplateProcessing, BertProcessing, RobertaProcessing.
-func (t *Tokenizer) applyPostProcessor(ids []int, spans []api.TokenSpan) ([]int, []api.TokenSpan) {
+func (t *Tokenizer) applyPostProcessor(ids []int, spans []api.TokenSpan) ([]int, []api.TokenSpan, []int) {
 	pp := t.tokenizer.PostProcessor
 	if pp == nil {
-		return ids, spans
+		return ids, spans, nil
 	}
 
 	switch pp.Type {
@@ -472,18 +496,19 @@ func (t *Tokenizer) applyPostProcessor(ids []int, spans []api.TokenSpan) ([]int,
 	case "BertProcessing", "RobertaProcessing":
 		return t.applyBertProcessing(pp, ids, spans)
 	default:
-		return ids, spans
+		return ids, spans, nil
 	}
 }
 
 // applyTemplateProcessing handles TemplateProcessing post-processors.
-func (t *Tokenizer) applyTemplateProcessing(pp *PostProcessor, ids []int, spans []api.TokenSpan) ([]int, []api.TokenSpan) {
+func (t *Tokenizer) applyTemplateProcessing(pp *PostProcessor, ids []int, spans []api.TokenSpan) ([]int, []api.TokenSpan, []int) {
 	if len(pp.Single) == 0 {
-		return ids, spans
+		return ids, spans, nil
 	}
 
 	var outIDs []int
 	var outSpans []api.TokenSpan
+	var outSpecial []int
 
 	for _, item := range pp.Single {
 		if item.SpecialToken != nil {
@@ -492,15 +517,19 @@ func (t *Tokenizer) applyTemplateProcessing(pp *PostProcessor, ids []int, spans 
 				outIDs = append(outIDs, st.IDs...)
 				for range st.IDs {
 					outSpans = append(outSpans, api.TokenSpan{Start: -1, End: -1})
+					outSpecial = append(outSpecial, 1)
 				}
 			}
 		} else if item.Sequence != nil {
 			outIDs = append(outIDs, ids...)
 			outSpans = append(outSpans, spans...)
+			for range ids {
+				outSpecial = append(outSpecial, 0)
+			}
 		}
 	}
 
-	return outIDs, outSpans
+	return outIDs, outSpans, outSpecial
 }
 
 // parseTokenIDTuple parses a JSON [string, int] tuple (e.g., ["[CLS]", 101])
@@ -522,31 +551,37 @@ func parseTokenIDTuple(raw json.RawMessage) (int, bool) {
 
 // applyBertProcessing handles BertProcessing and RobertaProcessing post-processors.
 // Format: {"type": "BertProcessing", "sep": ["[SEP]", 102], "cls": ["[CLS]", 101]}
-func (t *Tokenizer) applyBertProcessing(pp *PostProcessor, ids []int, spans []api.TokenSpan) ([]int, []api.TokenSpan) {
+func (t *Tokenizer) applyBertProcessing(pp *PostProcessor, ids []int, spans []api.TokenSpan) ([]int, []api.TokenSpan, []int) {
 	clsID, hasCLS := parseTokenIDTuple(pp.Cls)
 	sepID, hasSEP := parseTokenIDTuple(pp.Sep)
 
 	if !hasCLS && !hasSEP {
-		return ids, spans
+		return ids, spans, nil
 	}
 
 	syntheticSpan := api.TokenSpan{Start: -1, End: -1}
 
 	outIDs := make([]int, 0, len(ids)+2)
 	outSpans := make([]api.TokenSpan, 0, len(ids)+2)
+	outSpecial := make([]int, 0, len(ids)+2)
 
 	if hasCLS {
 		outIDs = append(outIDs, clsID)
 		outSpans = append(outSpans, syntheticSpan)
+		outSpecial = append(outSpecial, 1)
 	}
 	outIDs = append(outIDs, ids...)
 	outSpans = append(outSpans, spans...)
+	for range ids {
+		outSpecial = append(outSpecial, 0)
+	}
 	if hasSEP {
 		outIDs = append(outIDs, sepID)
 		outSpans = append(outSpans, syntheticSpan)
+		outSpecial = append(outSpecial, 1)
 	}
 
-	return outIDs, outSpans
+	return outIDs, outSpans, outSpecial
 }
 
 // addedTokenEntry pairs a token string with its ID for efficient matching.
@@ -881,7 +916,12 @@ func (t *Tokenizer) applyPreTokenizerWithSpans(text string, normOffsets []int, p
 		}
 		return byteLevelPreTokenizeWithOffsets(text, normOffsets)
 	case "Metaspace":
-		return metaspacePreTokenizeWithOffsets(text, normOffsets, pt.AddPrefixSpace)
+		// default to true if missing, not false
+		split := true
+		if pt.Split != nil {
+			split = *pt.Split
+		}
+		return metaspacePreTokenizeWithOffsets(text, normOffsets, pt.AddPrefixSpace, pt.Replacement, pt.PrependScheme, split)
 	case "Sequence":
 		result := []wordWithOffset{{text: text, start: 0, end: len(text)}}
 		if len(normOffsets) > 0 {
@@ -1123,8 +1163,11 @@ func byteLevelPreTokenizeWithOffsets(text string, normOffsets []int) []wordWithO
 }
 
 // metaspacePreTokenizeWithOffsets handles metaspace pre-tokenization with offsets.
-func metaspacePreTokenizeWithOffsets(text string, normOffsets []int, addPrefixSpace bool) []wordWithOffset {
-	if addPrefixSpace && len(text) > 0 && text[0] != ' ' {
+func metaspacePreTokenizeWithOffsets(text string, normOffsets []int, addPrefixSpace bool, replacement string, prependScheme string, split bool) []wordWithOffset {
+	if replacement == "" {
+		replacement = "\u2581"
+	}
+	if (addPrefixSpace || prependScheme == "always") && len(text) > 0 && text[0] != ' ' {
 		text = " " + text
 		newOffsets := make([]int, len(normOffsets)+1)
 		newOffsets[0] = 0
@@ -1139,7 +1182,7 @@ func metaspacePreTokenizeWithOffsets(text string, normOffsets []int, addPrefixSp
 
 	for i, r := range text {
 		if r == ' ' {
-			if current.Len() > 0 {
+			if split && current.Len() > 0 {
 				origStart := 0
 				origEnd := i
 				if currentStart < len(normOffsets) && currentStart >= 0 {
@@ -1154,9 +1197,12 @@ func metaspacePreTokenizeWithOffsets(text string, normOffsets []int, addPrefixSp
 					end:   origEnd,
 				})
 				current.Reset()
+				currentStart = i
 			}
-			current.WriteRune('\u2581')
-			currentStart = i
+			current.WriteString(replacement)
+			if currentStart == -1 {
+				currentStart = i
+			}
 		} else {
 			if currentStart == -1 {
 				currentStart = i
@@ -1525,17 +1571,73 @@ func (t *Tokenizer) applyDecoderStep(tokens []string, d *Decoder) []string {
 	switch d.Type {
 	case "Replace":
 		// Replace pattern in tokens
+		pattern := ""
+		if d.Pattern != nil {
+			if d.Pattern.Regex != "" {
+				pattern = d.Pattern.Regex
+			} else {
+				pattern = regexp.QuoteMeta(d.Pattern.String)
+			}
+		}
+		if pattern == "" {
+			return tokens
+		}
+		re, err := regexp.Compile(pattern)
+		if err != nil {
+			return tokens
+		}
 		var result []string
 		for _, tok := range tokens {
-			result = append(result, tok)
+			result = append(result, re.ReplaceAllString(tok, d.Content))
 		}
 		return result
 	case "Strip":
 		// Strip characters
-		return tokens
+		content := d.Content
+		if content == "" {
+			content = " \t\n\r"
+		}
+		var result []string
+		for _, tok := range tokens {
+			result = append(result, strings.Trim(tok, content))
+		}
+		return result
 	case "ByteFallback":
 		// Handle byte fallback decoding
-		return tokens
+		// In byte fallback, tokens that represent a single byte are encoded as <0xXX>
+		var result []string
+		for _, tok := range tokens {
+			if len(tok) == 6 && strings.HasPrefix(tok, "<0x") && strings.HasSuffix(tok, ">") {
+				// Potential byte fallback token
+				hex := tok[3:5]
+				var b byte
+				_, err := fmt.Sscanf(hex, "%02x", &b)
+				if err == nil {
+					result = append(result, string([]byte{b}))
+					continue
+				}
+			}
+			result = append(result, tok)
+		}
+		// If consecutive tokens are single bytes, they might form a multi-byte UTF-8 character.
+		// However, standard ByteFallback decoder in HuggingFace usually just converts them to bytes.
+		// The final join will then be a sequence of bytes which might be valid UTF-8.
+		return result
+	case "Metaspace":
+		// Metaspace replaces leading space with a replacement character (default \u2581)
+		replacement := d.Replacement
+		if replacement == "" {
+			replacement = "\u2581"
+		}
+		var result []string
+		for i, tok := range tokens {
+			decoded := strings.ReplaceAll(tok, replacement, " ")
+			if i == 0 && d.PrependScheme == "always" && strings.HasPrefix(decoded, " ") {
+				decoded = strings.TrimPrefix(decoded, " ")
+			}
+			result = append(result, decoded)
+		}
+		return result
 	default:
 		return tokens
 	}
@@ -1590,13 +1692,24 @@ func (t *Tokenizer) byteLevelDecode(tokens []string) string {
 }
 
 func (t *Tokenizer) metaspaceDecode(tokens []string) string {
+	replacement := t.tokenizer.Decoder.Replacement
+	if replacement == "" {
+		replacement = "\u2581"
+	}
+	prependScheme := t.tokenizer.Decoder.PrependScheme
 	var result strings.Builder
-	for _, token := range tokens {
+	for i, token := range tokens {
 		// Metaspace replaces leading space with special char
-		decoded := strings.ReplaceAll(token, "\u2581", " ")
+		decoded := strings.ReplaceAll(token, replacement, " ")
+		if i == 0 && prependScheme == "always" {
+			decoded = strings.TrimPrefix(decoded, " ")
+		} else if i == 0 && t.tokenizer.PreTokenizer != nil && (t.tokenizer.PreTokenizer.AddPrefixSpace || t.tokenizer.PreTokenizer.PrependScheme == "always") {
+			// Also check pre-tokenizer for compatibility
+			decoded = strings.TrimPrefix(decoded, " ")
+		}
 		result.WriteString(decoded)
 	}
-	return strings.TrimLeft(result.String(), " ")
+	return result.String()
 }
 
 func (t *Tokenizer) bpeDecode(tokens []string) string {
@@ -1725,8 +1838,10 @@ func removeAccents(text string) string {
 
 // Byte-level BPE encoding/decoding
 // GPT-2 uses a specific byte-to-unicode mapping
-var byteToUnicode map[byte]rune
-var unicodeToByte map[rune]byte
+var (
+	byteToUnicode map[byte]rune
+	unicodeToByte map[rune]byte
+)
 
 func init() {
 	byteToUnicode = make(map[byte]rune)
