@@ -6,6 +6,29 @@ import (
 	"os"
 )
 
+// TokenString handles token fields that may be a plain string or a special token object.
+type TokenString string
+
+func (t *TokenString) UnmarshalJSON(data []byte) error {
+	// Try plain string first.
+	var s string
+	if err := json.Unmarshal(data, &s); err == nil {
+		*t = TokenString(s)
+		return nil
+	}
+	// Try object with a "content" field (e.g. {"content": "[MASK]", ...}).
+	var obj struct {
+		Content string `json:"content"`
+	}
+	if err := json.Unmarshal(data, &obj); err == nil {
+		*t = TokenString(obj.Content)
+		return nil
+	}
+	// Null or anything else: leave as empty string.
+	*t = ""
+	return nil
+}
+
 type TokensDecoder struct {
 	Content    string `json:"content"`
 	Lstrip     bool   `json:"lstrip"`
@@ -31,13 +54,13 @@ type Config struct {
 	MaxLength      float64        `json:"max_length"`
 	SpModelKwargs  map[string]any `json:"sp_model_kwargs"`
 
-	ClsToken  string `json:"cls_token"`
-	UnkToken  string `json:"unk_token"`
-	SepToken  string `json:"sep_token"`
-	MaskToken string `json:"mask_token"`
-	BosToken  string `json:"bos_token"`
-	EosToken  string `json:"eos_token"`
-	PadToken  string `json:"pad_token"`
+	ClsToken  TokenString `json:"cls_token"`
+	UnkToken  TokenString `json:"unk_token"`
+	SepToken  TokenString `json:"sep_token"`
+	MaskToken TokenString `json:"mask_token"`
+	BosToken  TokenString `json:"bos_token"`
+	EosToken  TokenString `json:"eos_token"`
+	PadToken  TokenString `json:"pad_token"`
 
 	AddBosToken             bool                  `json:"add_bos_token"`
 	AddEosToken             bool                  `json:"add_eos_token"`
