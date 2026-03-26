@@ -5,6 +5,10 @@
 package tokenizers
 
 import (
+	"encoding/json"
+	"os"
+	"strings"
+
 	"github.com/gomlx/go-huggingface/hub"
 	"github.com/gomlx/go-huggingface/tokenizers/api"
 	"github.com/gomlx/go-huggingface/tokenizers/hftokenizer"
@@ -57,6 +61,13 @@ func New(repo *hub.Repo) (Tokenizer, error) {
 		return nil, err
 	}
 
+	if config.TokenizerClass == "" {
+		config.TokenizerClass, err = tokenizerClassFromModelType(repo)
+		if err != nil {
+			return nil, err
+		}
+	}
+
 	constructor, found := registerOfClasses[config.TokenizerClass]
 	if !found {
 		return nil, errors.Errorf("unknown tokenizer class %q", config.TokenizerClass)
@@ -95,6 +106,49 @@ type TokenizerConstructor func(config *api.Config, repo *hub.Repo) (api.Tokenize
 // RegisterTokenizerClass used by Tokenizer implementations.
 func RegisterTokenizerClass(name string, constructor TokenizerConstructor) {
 	registerOfClasses[name] = constructor
+}
+
+// tokenizerClassFromModelType reads config.json from the repo and maps the
+// model_type field to the appropriate tokenizer class name, following the same
+// logic as HuggingFace's AutoTokenizer.
+func tokenizerClassFromModelType(repo *hub.Repo) (string, error) {
+	path, err := repo.DownloadFile("config.json")
+	if err != nil {
+		return "", errors.Wrap(err, "download config.json for tokenizer class fallback")
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		return "", errors.Wrap(err, "open config.json for tokenizer class fallback")
+	}
+	defer f.Close()
+	var cfg struct {
+		ModelType string `json:"model_type"`
+	}
+	if err := json.NewDecoder(f).Decode(&cfg); err != nil {
+		return "", errors.Wrap(err, "parse config.json for tokenizer class fallback")
+	}
+	switch strings.ToLower(cfg.ModelType) {
+	case "bert":
+		return "BertTokenizerFast", nil
+	case "distilbert":
+		return "DistilBertTokenizerFast", nil
+	case "roberta", "mpnet":
+		return "RobertaTokenizerFast", nil
+	case "xlm-roberta":
+		return "XLMRobertaTokenizerFast", nil
+	case "deberta":
+		return "DebertaTokenizerFast", nil
+	case "deberta-v2":
+		return "DebertaV2TokenizerFast", nil
+	case "electra":
+		return "ElectraTokenizerFast", nil
+	case "gpt2":
+		return "GPT2TokenizerFast", nil
+	case "llama":
+		return "LlamaTokenizerFast", nil
+	default:
+		return "", errors.Errorf("no known tokenizer class for model_type %q", cfg.ModelType)
+	}
 }
 
 var (
